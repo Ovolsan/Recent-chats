@@ -5,7 +5,7 @@ __id__ = "recent_chats"
 __name__ = "Последние чаты"
 __description__ = "Свайп вверх по ⋮ или скрепке в строке ввода открывает последние чаты. Свежие — снизу; нажатие переключает чат."
 __author__ = "@Ovolsan @Ovolpost"
-__version__ = "20261013.1"
+__version__ = "20261013.2"
 __min_version__ = "12.10.6"
 __icon__ = "msg_viewchats"
 __permissions__ = ["ui", "messages.read", "hooks"]
@@ -203,6 +203,7 @@ class RecentChatsPlugin(BasePlugin):
             "Rect": "android.graphics.Rect",
             "Ellipsize": "android.text.TextUtils$TruncateAt",
             "Motion": "android.view.MotionEvent",
+            "Measure": "android.view.View$MeasureSpec",
             "ViewConfig": "android.view.ViewConfiguration",
             "Bundle": "android.os.Bundle",
             "System": "java.lang.System",
@@ -452,7 +453,7 @@ class RecentChatsPlugin(BasePlugin):
                  "provider": provider, "listeners": [], "scroll": scroll, "counters": [],
                  "observed": [], "refresh_scheduled": False, "spacer": spacer,
                  "spacer_height": 0, "list_rows": [], "touch_start": None, "touch_pull": None}
-        from android_utils import OnClickListener, OnTouchListener, run_on_ui_thread
+        from android_utils import OnClickListener, OnTouchListener
         popup["touch_listener"] = OnTouchListener(lambda view, event: self._list_touch(popup, event, view == scroll))
         scroll.setOnTouchListener(popup["touch_listener"])
         for entry in rows:
@@ -542,8 +543,14 @@ class RecentChatsPlugin(BasePlugin):
         root = button.getRootView()
         root.getLocationOnScreen(location)
         self._popup = popup
-        window.showAtLocation(button, 3 | 48, x - int(location[0]), y - int(location[1]))
         self._refresh_badges(popup)
+        # Lay out and position the list before attaching the popup, so its first
+        # frame already contains the newest chats instead of scrolling to them.
+        scroll.measure(self.Measure.makeMeasureSpec(width, self.Measure.EXACTLY),
+                       self.Measure.makeMeasureSpec(height, self.Measure.EXACTLY))
+        scroll.layout(0, 0, width, height)
+        scroll.scrollTo(0, max(0, int(content.getHeight()) - height))
+        window.showAtLocation(button, 3 | 48, x - int(location[0]), y - int(location[1]))
         observer = self._DialogObserver()
         observer.callback = lambda source_account: self._queue_badge_refresh(popup) if source_account == account else None
         popup["observer"] = observer
@@ -552,7 +559,6 @@ class RecentChatsPlugin(BasePlugin):
             event_id = int(getattr(self.Notifications, name))
             popup["notification_center"].addObserver(observer, event_id)
             popup["observed"].append(event_id)
-        run_on_ui_thread(lambda: scroll.fullScroll(130) if self._popup is popup else None)
 
     def _list_touch(self, popup, event, is_scroll=True):
         if self._popup is not popup or not self._active:
