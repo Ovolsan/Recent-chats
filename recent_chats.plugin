@@ -1,0 +1,808 @@
+# SPDX-License-Identifier: GPL-3.0-only
+"""Recently visited chats above the composer's ⋮ button in exteraLess."""
+
+__id__ = "recent_chats"
+__name__ = "Последние чаты"
+__description__ = "Свайп вверх по ⋮ или скрепке в строке ввода открывает последние чаты. Свежие — снизу; нажатие переключает чат."
+__author__ = "@Ovolsan @Ovolpost"
+__version__ = "20261013.1"
+__min_version__ = "12.10.6"
+__icon__ = "msg_viewchats"
+__permissions__ = ["ui", "messages.read", "hooks"]
+
+from base_plugin import BasePlugin
+
+
+STORE_KEY = "recent_chats_v1"
+MAX_HISTORY = 50
+ROW_DP = 48
+AVATAR_DP = 36
+REACHABLE_ROWS = 7
+EVENT_DP = 20.666
+
+
+class RecentHistory:
+    """Oldest first. Persistent account keys are user IDs, not reusable slots."""
+
+    def __init__(self, payload=None):
+        self.accounts = {}
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return
+        accounts = payload.get("accounts", {})
+        if not isinstance(accounts, dict):
+            return
+        for uid, rows in accounts.items():
+            try:
+                uid = int(uid)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if uid <= 0 or not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    did = int(row.get("did", 0))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if did and -(1 << 63) <= did < (1 << 63):
+                    self.visit(uid, did, str(row.get("title") or "Чат"))
+
+    def visit(self, uid, did, title):
+        uid, did = int(uid), int(did)
+        if uid <= 0 or did == 0:
+            return False
+        entry = {"did": did, "title": str(title or "Чат")[:256]}
+        rows = self.accounts.setdefault(str(uid), [])
+        if rows and rows[-1] == entry:
+            return False
+        rows[:] = [row for row in rows if row["did"] != did]
+        rows.append(entry)
+        del rows[:-MAX_HISTORY]
+        return True
+
+    def rows(self, uid, current=0):
+        return [dict(row) for row in self.accounts.get(str(int(uid)), [])
+                if row["did"] != int(current)]
+
+    def dump(self):
+        return {"version": 1, "accounts": {
+            uid: [dict(row) for row in rows] for uid, rows in self.accounts.items()}}
+
+
+class UpwardSwipe:
+    """Use raw coordinates because the finger can leave the small button."""
+
+    def __init__(self, threshold, slop):
+        self.threshold, self.slop = float(threshold), float(slop)
+        self.reset()
+
+    def reset(self):
+        self.start = None
+        self.claimed = False
+        self.rejected = False
+
+    def begin(self, x, y):
+        self.reset()
+        self.start = (float(x), float(y))
+
+    def move(self, x, y):
+        if self.start is None or self.rejected or self.claimed:
+            return self.claimed
+        dx, up = float(x) - self.start[0], self.start[1] - float(y)
+        if up >= self.threshold and up > abs(dx) * 1.25:
+            self.claimed = True
+        elif max(abs(dx), abs(up)) > self.slop and (up < 0 or abs(dx) >= abs(up)):
+            self.rejected = True
+        return self.claimed
+
+
+def dialog_arguments(did):
+    """Mirror DialogObject's encrypted-chat flag, including its positive ID."""
+    did = int(did)
+    if did > 0 and did & 0x4000000000000000:
+        return "enc_id", did & 0xffffffff
+    if did < 0:
+        return "chat_id", -did
+    if did > 0:
+        return "user_id", did
+    raise ValueError("Нулевой идентификатор чата")
+
+
+def dialog_counters(dialog, muted=False, topic_counts=None):
+    """Use topic aggregates for forums, and dialog fields for ordinary chats."""
+    if topic_counts is not None:
+        return (max(0, int(topic_counts[0])), max(0, int(topic_counts[1])),
+                max(0, int(topic_counts[2])), bool(dialog.unread_mark) if dialog is not None else False, bool(muted))
+    if dialog is None:
+        return (0, 0, 0, False, bool(muted))
+    return (max(0, int(dialog.unread_count)), max(0, int(dialog.unread_mentions_count)),
+            max(0, int(dialog.unread_reactions_count)), bool(dialog.unread_mark), bool(muted))
+
+
+def counter_events(counters):
+    unread, mentions, reactions, marked, muted = counters
+    events = []
+    if reactions:
+        events.append(("reaction", reactions, False, "Непрочитанные реакции"))
+    if mentions:
+        events.append(("mention", mentions, False, "Непрочитанные упоминания"))
+    if unread or marked:
+        events.append(("message", unread, muted, "Непрочитанные сообщения"))
+    return events
+
+
+def popup_geometry(left, top, right, input_top, row_count, row_height, max_height):
+    """A full-width rectangle whose bottom touches the composer container."""
+    height = min(max(1, int(row_count)) * int(row_height), int(max_height), int(input_top) - int(top))
+    return int(left), int(input_top) - height, int(right) - int(left), height
+
+
+class RecentChatsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._active = True
+        self._hooks = []
+        self._states = {}
+        self._popup = None
+        self._generation = 0
+        self._errors = set()
+        self._history = RecentHistory(self.get_setting(STORE_KEY))
+        self._status = "Загрузка…"
+        try:
+            self._init_android()
+            self._hook("createView", 1, before=self._before_create, after=self._after_create)
+            self._hook("onResume", 0, after=self._resume)
+            self._hook("onPause", 0, before=self._pause)
+            self._hook("onFragmentDestroy", 0, before=self._destroy)
+            self._status = "Свайп вверх по ⋮ в строке ввода"
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(self._attach_current)
+        except Exception as error:
+            self._status = "Не удалось включить жест: " + str(error)
+            self.log(self._status)
+            self.on_plugin_unload()
+
+    def _init_android(self):
+        from java import jclass, jlong, jint, jarray, dynamic_proxy
+        from hook_utils import get_private_field
+        self._get = get_private_field
+        self._jlong, self._jint, self._jarray = jlong, jint, jarray
+        names = {
+            "Chat": "org.telegram.ui.ChatActivity",
+            "Enter": "org.telegram.ui.Components.ChatActivityEnterView",
+            "AU": "org.telegram.messenger.AndroidUtilities",
+            "UserConfig": "org.telegram.messenger.UserConfig",
+            "Controller": "org.telegram.messenger.MessagesController",
+            "ChatObject": "org.telegram.messenger.ChatObject",
+            "Storage": "org.telegram.messenger.MessagesStorage",
+            "UserObject": "org.telegram.messenger.UserObject",
+            "Theme": "org.telegram.ui.ActionBar.Theme",
+            "Locale": "org.telegram.messenger.LocaleController",
+            "RString": "org.telegram.messenger.R$string",
+            "RDrawable": "org.telegram.messenger.R$drawable",
+            "Linear": "android.widget.LinearLayout",
+            "Scroll": "android.widget.ScrollView",
+            "Frame": "android.widget.FrameLayout",
+            "Text": "android.widget.TextView",
+            "Image": "org.telegram.ui.Components.BackupImageView",
+            "Icon": "android.widget.ImageView",
+            "IconScale": "android.widget.ImageView$ScaleType",
+            "Avatar": "org.telegram.ui.Components.AvatarDrawable",
+            "ImageLocation": "org.telegram.messenger.ImageLocation",
+            "Popup": "android.widget.PopupWindow",
+            "ColorDrawable": "android.graphics.drawable.ColorDrawable",
+            "ColorFilter": "android.graphics.PorterDuffColorFilter",
+            "BlendMode": "android.graphics.PorterDuff$Mode",
+            "ShapeDrawable": "android.graphics.drawable.ShapeDrawable",
+            "PathShape": "android.graphics.drawable.shapes.PathShape",
+            "Path": "android.graphics.Path",
+            "RectF": "android.graphics.RectF",
+            "BubblePath": "org.telegram.ui.Components.BubbleCounterPath",
+            "Notifications": "org.telegram.messenger.NotificationCenter",
+            "Layout": "org.telegram.ui.Components.LayoutHelper",
+            "Rect": "android.graphics.Rect",
+            "Ellipsize": "android.text.TextUtils$TruncateAt",
+            "Motion": "android.view.MotionEvent",
+            "ViewConfig": "android.view.ViewConfiguration",
+            "Bundle": "android.os.Bundle",
+            "System": "java.lang.System",
+        }
+        for alias, name in names.items():
+            setattr(self, alias, jclass(name))
+        menu_methods = [method for method in self.Enter.getClass().getDeclaredMethods()
+                        if str(method.getName()) == "isAudioVideoSendButtonInMenuState"
+                        and len(method.getParameterTypes()) == 0]
+        if len(menu_methods) != 1:
+            raise RuntimeError("Не найдена нижняя кнопка меню")
+        self._menu_state_method = menu_methods[0]
+        self._menu_state_method.setAccessible(True)
+        self._empty_objects = self._jarray(jclass("java.lang.Object"))([])
+
+        class DismissListener(dynamic_proxy(jclass("android.widget.PopupWindow$OnDismissListener"))):
+            def onDismiss(self):
+                self.callback()
+
+        self._DismissListener = DismissListener
+        class DialogObserver(dynamic_proxy(jclass("org.telegram.messenger.NotificationCenter$NotificationCenterDelegate"))):
+            def didReceivedNotification(self, notification_id, account, args):
+                self.callback(int(account))
+
+        self._DialogObserver = DialogObserver
+
+    def _dp(self, value):
+        return int(self.AU.dp(float(value)))
+
+    def _key(self, obj):
+        return int(self.System.identityHashCode(obj))
+
+    def _uid(self, account):
+        return int(self.UserConfig.getInstance(int(account)).getClientUserId())
+
+    def _report(self, label, error):
+        if label not in self._errors:
+            self._errors.add(label)
+            self.log(label + ": " + str(error))
+
+    def _guard(self, label, callback):
+        def guarded(param):
+            if self._active:
+                try:
+                    callback(param)
+                except Exception as error:
+                    self._report(label, error)
+        return guarded
+
+    def _hook(self, name, count, before=None, after=None):
+        methods = [method for method in self.Chat.getClass().getDeclaredMethods()
+                   if str(method.getName()) == name and len(method.getParameterTypes()) == count]
+        if len(methods) != 1:
+            raise RuntimeError("Несовместимый метод ChatActivity." + name)
+        methods[0].setAccessible(True)
+        hook = self.hook_method(methods[0],
+                                before=self._guard(name, before) if before else None,
+                                after=self._guard(name, after) if after else None)
+        if not hook:
+            raise RuntimeError("Нужны доверенный доступ и разрешение hooks")
+        self._hooks.append(hook)
+
+    def _before_create(self, param):
+        self._detach(self._key(param.thisObject))
+
+    def _after_create(self, param):
+        if param.getThrowable() is None:
+            self._attach(param.thisObject)
+
+    def _resume(self, param):
+        fragment = param.thisObject
+        self._attach(fragment)
+        self._visit(fragment)
+
+    def _pause(self, param):
+        self._generation += 1
+        self._dismiss_popup()
+        for state in self._states.get(self._key(param.thisObject), []):
+            state["swipe"].reset()
+            self._intercept(state["button"], False)
+
+    def _destroy(self, param):
+        self._detach(self._key(param.thisObject))
+
+    def _attach_current(self):
+        from client_utils import get_last_fragment
+        fragment = get_last_fragment()
+        if self._active and isinstance(fragment, self.Chat):
+            self._attach(fragment)
+            self._visit(fragment)
+
+    def _visit(self, fragment):
+        # Scheduled messages, search and business editors are not chat visits.
+        if int(self._get(fragment, "chatMode")) not in (0, 3):
+            return
+        account, did = int(fragment.getCurrentAccount()), int(fragment.getDialogId())
+        uid = self._uid(account)
+        if uid > 0 and did:
+            title, _ = self._peer_info(account, did, "Чат")
+            if self._history.visit(uid, did, title):
+                self.set_setting(STORE_KEY, self._history.dump())
+
+    def _attach(self, fragment):
+        key = self._key(fragment)
+        enter = self._get(fragment, "chatActivityEnterView")
+        if enter is None:
+            return
+        targets = [(self._get(enter, "attachButton"), False),
+                   (self._get(enter, "audioVideoButtonContainer"), True)]
+        targets = [(button, menu_only) for button, menu_only in targets if button is not None]
+        old = self._states.get(key)
+        if old and len(old) == len(targets) and all(state["button"] == target[0]
+                                                  for state, target in zip(old, targets)):
+            return
+        self._detach(key)
+        from android_utils import OnTouchListener
+        self._states[key] = []
+        for button, menu_only in targets:
+            info = self._get(button, "mListenerInfo")
+            original = self._get(info, "mOnTouchListener") if info is not None else None
+            state = {"fragment": fragment, "button": button, "enter": enter, "original": original,
+                     "menu_only": menu_only,
+                     "swipe": UpwardSwipe(self._dp(24), self.ViewConfig.get(button.getContext()).getScaledTouchSlop())}
+            state["listener"] = OnTouchListener(lambda view, event, target=state: self._touch(target, view, event))
+            self._states[key].append(state)
+            button.setOnTouchListener(state["listener"])
+
+    def _detach(self, key):
+        for state in self._states.pop(key, []):
+            button = state["button"]
+            self._intercept(button, False)
+            info = self._get(button, "mListenerInfo")
+            current = self._get(info, "mOnTouchListener") if info is not None else None
+            # A later plugin may have replaced our listener: leave its listener alone.
+            if current == state["listener"]:
+                button.setOnTouchListener(state["original"])
+
+    def _is_menu_state(self, enter):
+        result = self._menu_state_method.invoke(enter, self._empty_objects)
+        return str(result).lower() == "true"
+
+    def _intercept(self, view, value):
+        parent = view.getParent()
+        if parent is not None:
+            parent.requestDisallowInterceptTouchEvent(bool(value))
+
+    def _touch(self, state, view, event):
+        swipe = state["swipe"]
+        action = int(event.getActionMasked())
+        try:
+            if not self._active:
+                return False
+            if action == 0:
+                swipe.reset()
+                if state.get("menu_only") and not self._is_menu_state(state["enter"]):
+                    original = state["original"]
+                    return bool(original.onTouch(view, event)) if original is not None else False
+                swipe.begin(event.getRawX(), event.getRawY())
+                self._intercept(view, True)
+            elif swipe.start is not None:
+                if action in (1, 2):
+                    was_claimed = swipe.claimed
+                    swipe.move(event.getRawX(), event.getRawY())
+                    if swipe.claimed and not was_claimed:
+                        cancel = self.Motion.obtain(event)
+                        try:
+                            cancel.setAction(3)
+                            view.onTouchEvent(cancel)
+                            if state["original"] is not None:
+                                state["original"].onTouch(view, cancel)
+                        finally:
+                            cancel.recycle()
+                        view.cancelLongPress()
+                    claimed = swipe.claimed
+                    if action == 1:
+                        swipe.reset()
+                        self._intercept(view, False)
+                        if claimed:
+                            self._show_popup(state)
+                    elif swipe.rejected:
+                        self._intercept(view, False)
+                    if claimed:
+                        return True
+                elif action in (3, 5):
+                    claimed = swipe.claimed
+                    swipe.reset()
+                    self._intercept(view, False)
+                    return claimed
+            original = state["original"]
+            return bool(original.onTouch(view, event)) if original is not None else False
+        except Exception as error:
+            self._report("Свайп", error)
+            claimed = swipe.claimed
+            swipe.reset()
+            self._intercept(view, False)
+            return claimed
+
+    def _peer_info(self, account, did, fallback):
+        controller = self.Controller.getInstance(account)
+        kind, peer_id = dialog_arguments(did)
+        if kind == "chat_id":
+            peer = controller.getChat(self._jlong(peer_id))
+            return (str(peer.title), peer) if peer is not None else (fallback, None)
+        if kind == "enc_id":
+            encrypted = controller.getEncryptedChat(int(peer_id))
+            peer = controller.getUser(self._jlong(encrypted.user_id)) if encrypted is not None else None
+        else:
+            peer = controller.getUser(self._jlong(peer_id))
+        if peer is None:
+            return fallback, None
+        if kind == "user_id" and peer_id == self._uid(account):
+            return str(self.Locale.getString(self.RString.SavedMessages)), peer
+        return str(self.UserObject.getUserName(peer)), peer
+
+    def _dismiss_popup(self):
+        state, self._popup = self._popup, None
+        if state is not None:
+            state["window"].dismiss()
+
+    def _show_popup(self, state):
+        fragment, button = state["fragment"], state["button"]
+        account = int(fragment.getCurrentAccount())
+        uid = self._uid(account)
+        if uid <= 0 or not button.isAttachedToWindow():
+            return
+        self._dismiss_popup()
+        rows = self._history.rows(uid, fragment.getDialogId())
+        context = button.getContext()
+        provider = fragment.getResourceProvider()
+        background = self.Theme.getColor(self.Theme.key_actionBarDefaultSubmenuBackground, provider)
+        scroll = self.Scroll(context)
+        # Transparent space above the oldest row can reveal the chat beneath.
+        scroll.setBackgroundColor(0)
+        scroll.setFillViewport(False)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.setOverScrollMode(2)
+        content = self.Linear(context)
+        content.setOrientation(1)
+        scroll.addView(content)
+        spacer = self.Frame(context)
+        content.addView(spacer, self.Layout.createLinear(-1, 0))
+        list_content = self.Linear(context)
+        list_content.setOrientation(1)
+        list_content.setBackgroundColor(background)
+        content.addView(list_content, self.Layout.createLinear(-1, -2))
+        popup = {"window": None, "fragment": fragment, "account": account, "uid": uid,
+                 "provider": provider, "listeners": [], "scroll": scroll, "counters": [],
+                 "observed": [], "refresh_scheduled": False, "spacer": spacer,
+                 "spacer_height": 0, "list_rows": [], "touch_start": None, "touch_pull": None}
+        from android_utils import OnClickListener, OnTouchListener, run_on_ui_thread
+        popup["touch_listener"] = OnTouchListener(lambda view, event: self._list_touch(popup, event, view == scroll))
+        scroll.setOnTouchListener(popup["touch_listener"])
+        for entry in rows:
+            did = entry["did"]
+            title, peer = self._peer_info(account, did, entry["title"])
+            row = self.Linear(context)
+            row.setOrientation(0)
+            row.setGravity(16)
+            row.setPadding(self._dp(12), 0, self._dp(12), 0)
+            row.setBackground(self.Theme.createSelectorDrawable(self.Theme.getColor(self.Theme.key_listSelector, provider)))
+            # The native AvatarDrawable still draws a circle at radius=0.
+            # A square TextView underneath the photo also keeps placeholders square.
+            avatar = self.Frame(context)
+            initials = self.Text(context)
+            words = title.split()
+            initials.setText((words[0][:1] + (words[-1][:1] if len(words) > 1 else "")).upper() if words else "?")
+            initials.setTextSize(16.0)
+            initials.setTextColor(-1)
+            initials.setGravity(17)
+            initials.setBackgroundColor(self.Avatar.getColorForId(self._jlong(did)))
+            avatar.addView(initials, self.Layout.createFrame(-1, -1))
+            image = self.Image(context)
+            image.setRoundRadius(0)
+            if peer is not None and did != uid:
+                location = (self.ImageLocation.getForChat(account, peer, self.ImageLocation.TYPE_SMALL)
+                            if did < 0 else self.ImageLocation.getForUser(account, peer, self.ImageLocation.TYPE_SMALL))
+                image.setImage(location, "50_50", self.ColorDrawable(0), peer)
+            avatar.addView(image, self.Layout.createFrame(-1, -1))
+            row.addView(avatar, self.Layout.createLinear(AVATAR_DP, AVATAR_DP))
+            text = self.Text(context)
+            text.setText(title)
+            text.setTextSize(16.0)
+            text.setTextColor(self.Theme.getColor(self.Theme.key_actionBarDefaultSubmenuItem, provider))
+            text.setGravity(3 | 16)
+            text.setSingleLine(True)
+            text.setEllipsize(self.Ellipsize.END)
+            text_params = self.Linear.LayoutParams(0, -1, 1.0)
+            text_params.leftMargin = self._dp(12)
+            text_params.rightMargin = self._dp(8)
+            row.addView(text, text_params)
+            badges = self.Linear(context)
+            badges.setOrientation(0)
+            badges.setGravity(16)
+            row.addView(badges, self.Layout.createLinear(-2, -1))
+            popup["counters"].append({"did": did, "view": badges, "value": None})
+            listener = OnClickListener(lambda view, target=did: self._open_dialog(fragment, account, uid, target))
+            popup["listeners"].append(listener)
+            row.setOnClickListener(listener)
+            row.setOnTouchListener(popup["touch_listener"])
+            popup["list_rows"].append(row)
+            list_content.addView(row, self.Layout.createLinear(-1, ROW_DP))
+        if not rows:
+            text = self.Text(context)
+            text.setText("Здесь появятся открытые вами чаты")
+            text.setTextSize(14.0)
+            text.setGravity(17)
+            text.setPadding(self._dp(16), self._dp(12), self._dp(16), self._dp(12))
+            text.setTextColor(self.Theme.getColor(self.Theme.key_actionBarDefaultSubmenuItem, provider))
+            list_content.addView(text, self.Layout.createLinear(-1, 64))
+
+        rect = self.Rect()
+        button.getWindowVisibleDisplayFrame(rect)
+        location = self._jarray(self._jint)([0, 0])
+        # Anchor to the input container, including multiline drafts.
+        button.getParent().getLocationOnScreen(location)
+        x, y, width, height = popup_geometry(rect.left, rect.top, rect.right, location[1],
+                                            len(rows), self._dp(ROW_DP if rows else 64), int(location[1]) - int(rect.top))
+        if width <= 0 or height <= 0:
+            return
+        window = self.Popup(scroll, width, height, True)
+        popup["window"] = window
+        popup["height"] = height
+        popup["top"] = y
+        window.setBackgroundDrawable(self.ColorDrawable(0))
+        window.setElevation(0.0)
+        window.setOutsideTouchable(True)
+        window.setClippingEnabled(True)
+        window.setFocusable(True)
+        window.setInputMethodMode(2)
+        window.setSoftInputMode(0)
+        scroll.setFocusableInTouchMode(True)
+        listener = self._DismissListener()
+        listener.callback = lambda: self._popup_closed(popup)
+        popup["dismiss_listener"] = listener
+        window.setOnDismissListener(listener)
+        # Android's popup coordinates are in the containing window, not screen.
+        root = button.getRootView()
+        root.getLocationOnScreen(location)
+        self._popup = popup
+        window.showAtLocation(button, 3 | 48, x - int(location[0]), y - int(location[1]))
+        self._refresh_badges(popup)
+        observer = self._DialogObserver()
+        observer.callback = lambda source_account: self._queue_badge_refresh(popup) if source_account == account else None
+        popup["observer"] = observer
+        popup["notification_center"] = self.Notifications.getInstance(account)
+        for name in ("updateInterfaces", "dialogsNeedReload", "dialogsUnreadCounterChanged", "dialogsUnreadReactionsCounterChanged", "topicsDidLoaded"):
+            event_id = int(getattr(self.Notifications, name))
+            popup["notification_center"].addObserver(observer, event_id)
+            popup["observed"].append(event_id)
+        run_on_ui_thread(lambda: scroll.fullScroll(130) if self._popup is popup else None)
+
+    def _list_touch(self, popup, event, is_scroll=True):
+        if self._popup is not popup or not self._active:
+            return False
+        try:
+            action = int(event.getActionMasked())
+            # ScrollView cancels the pressed row when it takes over the drag.
+            # Keep its DOWN coordinates until the parent receives MOVE/UP.
+            if action == 3 and not is_scroll:
+                return False
+            x, y = float(event.getRawX()), float(event.getRawY())
+            scroll = popup["scroll"]
+            if action == 0:
+                popup["touch_start"] = (x, y, int(scroll.getScrollY()))
+                popup["touch_pull"] = None
+            elif action == 2:
+                start = popup["touch_start"]
+                if (start is not None and popup["touch_pull"] is None
+                        and start[2] <= popup["spacer_height"] + self._dp(2)
+                        and int(scroll.getScrollY()) <= popup["spacer_height"] + self._dp(2)
+                        and y - start[1] >= self._dp(24) and y - start[1] > abs(x - start[0]) * 1.25):
+                    # Take over at the current visible position without a jump.
+                    gap = max(0, popup["spacer_height"] - int(scroll.getScrollY()))
+                    popup["touch_pull"] = (y, gap)
+                    cancel = self.Motion.obtain(event)
+                    try:
+                        cancel.setAction(3)
+                        scroll.onTouchEvent(cancel)
+                    finally:
+                        cancel.recycle()
+                pull = popup["touch_pull"]
+                if pull is not None:
+                    self._lower_oldest(popup, pull[1] + y - pull[0])
+                    return True
+            elif action in (1, 3):
+                claimed = popup["touch_pull"] is not None
+                popup["touch_pull"] = None
+                start, popup["touch_start"] = popup["touch_start"], None
+                gap = max(0, popup["spacer_height"] - int(scroll.getScrollY()))
+                # A tap in the transparent upper area closes the list.
+                if (action == 1 and start is not None and gap > 0
+                        and max(abs(x - start[0]), abs(y - start[1])) < self._dp(8)
+                        and y < popup["top"] + gap):
+                    self._dismiss_popup()
+                    return True
+                return claimed
+        except Exception as error:
+            self._report("Прокрутка последних чатов", error)
+        return False
+
+    def _lower_oldest(self, popup, distance):
+        if self._popup is not popup:
+            return
+        limit = max(0, popup["height"] - self._dp(ROW_DP * REACHABLE_ROWS))
+        extra = min(limit, max(0, int(round(distance))))
+        if extra == popup["spacer_height"]:
+            return
+        popup["spacer_height"] = extra
+        params = popup["spacer"].getLayoutParams()
+        params.height = extra
+        popup["spacer"].setLayoutParams(params)
+        popup["scroll"].scrollTo(0, 0)
+
+    def _refresh_badges(self, popup):
+        if not self._active or self._uid(popup["account"]) != popup["uid"]:
+            return
+        controller = self.Controller.getInstance(popup["account"])
+        provider = popup["provider"]
+        for entry in popup["counters"]:
+            did = self._jlong(entry["did"])
+            dialog = controller.getDialog(did)
+            muted = bool(controller.isDialogMuted(did, self._jlong(0))) if dialog is not None else False
+            value = self._native_counters(controller, popup["account"], entry["did"], dialog, muted)
+            if entry["value"] == value:
+                continue
+            entry["value"] = value
+            holder = entry["view"]
+            holder.removeAllViews()
+            for index, (kind, count, grey, description) in enumerate(counter_events(value)):
+                badge, width, height = self._event_badge(holder.getContext(), provider, kind, count, grey, description)
+                params = self.Linear.LayoutParams(width, height)
+                params.leftMargin = self._dp(4) if index else 0
+                holder.addView(badge, params)
+
+    def _native_counters(self, controller, account, did, dialog, muted):
+        chat = controller.getChat(self._jlong(-did)) if did < 0 else None
+        topic_counts = None
+        if chat is not None:
+            if chat.forum or chat.monoforum and self.ChatObject.canManageMonoForum(account, chat):
+                topic_counts = controller.getTopicsController().getForumUnreadCount(chat.id)
+                if chat.forum:
+                    # A forum is accented if any unread topic has notifications on.
+                    muted = int(topic_counts[3]) == 0
+            counters = dialog_counters(dialog, muted, topic_counts)
+            if self.ChatObject.isMonoForum(chat):
+                return (counters[0], 0, counters[2], counters[3], counters[4])
+            return counters
+        return dialog_counters(dialog, muted)
+
+    def _event_badge(self, context, provider, kind, count, grey, description):
+        size = self._dp(EVENT_DP)
+        height = size
+        if kind == "message":
+            label = str(count) if count else "•"
+            badge = self.Text(context)
+            badge.setText(label)
+            badge.setTextSize(13.0)
+            badge.setTypeface(self.AU.bold())
+            badge.setIncludeFontPadding(False)
+            badge.setGravity(17)
+            width = max(size, int(badge.getPaint().measureText(label) + 0.999) + self._dp(11))
+            path = self.Path()
+            self.BubblePath.addBubbleRect(path, self.RectF(0.0, 0.0, float(width), float(size)), float(self._dp(10.33)))
+            background = self.ShapeDrawable(self.PathShape(path, float(width), float(size)))
+            key = self.Theme.key_chats_unreadCounterMuted if grey else self.Theme.key_chats_unreadCounter
+            background.getPaint().setColor(self.Theme.getColor(key, provider))
+            background.getPaint().setAntiAlias(True)
+            badge.setBackground(background)
+            badge.setTextColor(self.Theme.getColor(self.Theme.key_chats_unreadCounterText, provider))
+        else:
+            resource = (self.RDrawable.filled_chatlist_reaction if kind == "reaction"
+                        else self.RDrawable.filled_chatlist_mention)
+            drawable = context.getResources().getDrawable(resource).mutate()
+            key = (self.Theme.key_dialogReactionMentionBackground if kind == "reaction"
+                   else self.Theme.key_chats_unreadCounter)
+            drawable.setColorFilter(self.ColorFilter(self.Theme.getColor(key, provider), self.BlendMode.SRC_IN))
+            badge = self.Icon(context)
+            badge.setScaleType(self.IconScale.CENTER)
+            badge.setImageDrawable(drawable)
+            width = max(size, int(drawable.getIntrinsicWidth()))
+            height = max(size, int(drawable.getIntrinsicHeight()))
+        badge.setContentDescription(description + ": " + str(count) if count else "Чат отмечен непрочитанным")
+        return badge, width, height
+
+    def _queue_badge_refresh(self, popup):
+        if self._popup is not popup or popup["refresh_scheduled"]:
+            return
+        popup["refresh_scheduled"] = True
+
+        def refresh():
+            popup["refresh_scheduled"] = False
+            if self._popup is popup:
+                try:
+                    self._refresh_badges(popup)
+                except Exception as error:
+                    self._report("Счётчики чатов", error)
+
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(refresh, delay=80)
+
+    def _popup_closed(self, popup):
+        popup["scroll"].setOnTouchListener(None)
+        for row in popup["list_rows"]:
+            row.setOnTouchListener(None)
+        for event_id in popup["observed"]:
+            popup["notification_center"].removeObserver(popup["observer"], event_id)
+        popup["observed"].clear()
+        if self._popup is popup:
+            self._popup = None
+
+    def _open_dialog(self, fragment, account, uid, did):
+        self._dismiss_popup()
+        self._generation += 1
+        generation = self._generation
+
+        def valid():
+            from client_utils import get_last_fragment
+            return (self._active and self._generation == generation and self._uid(account) == uid
+                    and get_last_fragment() == fragment)
+
+        def load():
+            if not valid():
+                return
+            kind, peer_id = dialog_arguments(did)
+            controller = self.Controller.getInstance(account)
+            storage = self.Storage.getInstance(account)
+            if kind == "chat_id":
+                peer = controller.getChat(self._jlong(peer_id))
+                peer = peer if peer is not None else storage.getChatSync(self._jlong(peer_id))
+            elif kind == "enc_id":
+                peer = controller.getEncryptedChat(int(peer_id))
+                peer = peer if peer is not None else controller.getEncryptedChatDB(int(peer_id), False)
+            else:
+                peer = controller.getUser(self._jlong(peer_id))
+                peer = peer if peer is not None else storage.getUserSync(self._jlong(peer_id))
+            user = None
+            if kind == "enc_id" and peer is not None:
+                user = controller.getUser(self._jlong(peer.user_id))
+                user = user if user is not None else storage.getUserSync(self._jlong(peer.user_id))
+
+            def show():
+                if not valid():
+                    return
+                if peer is None or (kind == "enc_id" and user is None):
+                    from ui.bulletin import BulletinHelper
+                    BulletinHelper.show_error("Чат больше недоступен на этом устройстве.", fragment)
+                    return
+                args = self.Bundle()
+                if kind == "chat_id":
+                    controller.putChat(peer, True)
+                    args.putLong(kind, self._jlong(peer_id))
+                elif kind == "enc_id":
+                    controller.putEncryptedChat(peer, True)
+                    controller.putUser(user, True)
+                    args.putInt(kind, int(peer_id))
+                else:
+                    controller.putUser(peer, True)
+                    args.putLong(kind, self._jlong(peer_id))
+                if kind != "enc_id" and not controller.checkCanOpenChat(args, fragment):
+                    return
+                chat = self.Chat(args)
+                chat.setCurrentAccount(account)
+                # Replace the current chat instead of growing a stack on each switch.
+                fragment.presentFragment(chat, True)
+
+            from android_utils import run_on_ui_thread
+            run_on_ui_thread(show)
+
+        from client_utils import run_on_queue
+        run_on_queue(load, queue="recent_chats_open")
+
+    def on_plugin_unload(self):
+        self._active = False
+        self._generation += 1
+        for hook in self._hooks:
+            self.unhook_method(hook)
+        self._hooks.clear()
+
+        def cleanup():
+            self._dismiss_popup()
+            for key in list(self._states):
+                self._detach(key)
+
+        from android_utils import run_on_ui_thread
+        run_on_ui_thread(cleanup)
+
+    def create_settings(self):
+        from ui.settings import Divider
+        description = (
+            "Проведите вверх по ⋮ в строке ввода, чтобы открыть последние чаты. "
+            "Свайп также работает со скрепки — при пустом и заполненном поле.\n\n"
+            "Сверху — давние чаты, снизу — недавно открытые. "
+            "Нажмите на чат, чтобы переключиться. Текущий чат скрыт; список можно прокручивать.\n\n"
+            "Чтобы опустить самые давние чаты для одной руки, дойдите до начала списка "
+            "и проведите вниз ещё раз.\n\n"
+            "Справа показаны значки новых событий: сердце — реакции, @ — упоминания, "
+            "пузырь сообщения — число непрочитанных. Индикаторы обновляются, пока список открыт.\n\n"
+            "История до 50 чатов хранится на устройстве отдельно для каждого аккаунта "
+            "и сохраняется после перезапуска."
+        )
+        if not getattr(self, "_active", False):
+            description += "\n\n" + getattr(self, "_status", "Плагин выключен")
+        return [Divider(description)]
